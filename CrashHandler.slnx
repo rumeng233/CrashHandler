@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="CrashHandler.vcxproj" Id="d87f0a50-286b-4fa1-8fab-6c0a138820a3" />
+</Solution>
