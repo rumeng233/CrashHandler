@@ -47,5 +47,5 @@ CrashHandler.exe 1234 C:\dumps\crash.dmp true false 0x00000000
 ## 注意事项
 如需自包含dbghelp.dll, 可将dbghelp.dll与CrashHandler.exe放在同一目录下, 程序会自动使用当前目录下的dbghelp.dll, 详见[DbgHelp 版本](https://learn.microsoft.com/windows/win32/debug/dbghelp-versions)
 
-`AbnormalExitDump`参数仅在Windows 10及以上版本中测试有效, Windows 10以下的版本不保证其生效
+`AbnormalExitDump`参数仅在Windows 10及以上版本中测试有效, Windows 10以下的版本不保证其生效  
 碍于`AbnormalExitDump`的实现方式, 开启后可能会导致误报、漏报等情况, 请酌情开启
