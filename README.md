@@ -1,7 +1,7 @@
 # CrashHandler
 
+[![GitHub Release](https://img.shields.io/github/v/release/rumeng233/CrashHandler?color=brightgreen)](https://github.com/rumeng233/CrashHandler/releases)
 [![License: LGPL v3](https://img.shields.io/badge/License-LGPL%20v3-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
-[![GitHub Release](https://img.shields.io/github/v/release/rumeng233/CrashHandler)](https://github.com/rumeng233/CrashHandler/releases)
 
 一个轻量级Windows崩溃捕获工具，通过**附加调试器**在目标进程发生未处理异常或异常退出(需开启`AbnormalExitDump`)时自动生成转储
 
@@ -48,6 +48,8 @@ CrashHandler.exe 1234 C:\dumps\crash.dmp true false 0x00000000
 开启`AbnormalExitDump`后, 当目标进程抛出异常时, 会立即记录下当前线程的TID、异常信息、线程上下文 _(该操作早于目标进程中任何异常处理程序的执行)_  
 若目标进程捕获该异常且准备退出时 _(`EXIT_THREAD_DEBUG_EVENT`, 当调用`NtTerminateProcess`时操作系统会先向调试器发送`EXIT_THREAD_DEBUG_EVENT`, 所有线程都退出后才会发送`EXIT_PROCESS_DEBUG_EVENT`, 但由于`EXIT_PROCESS_DEBUG_EVENT`触发时间太晚, 线程已被销毁, 故选择使用`EXIT_THREAD_DEBUG_EVENT`)_  
 如果进程退出代码不等于`STATUS_SUCCESS`且进程中有任意一个线程的最后系统调用是`NtTerminateProcess`时, 则生成转储并退出
+
+经测试, 开启`AbnormalExitDump`后可以捕获CLR的`System.ExecutionEngineException`、`System.StackOverflowException`等异常并生成转储
 
 ## 注意事项
 如需自包含dbghelp.dll, 可将dbghelp.dll与CrashHandler.exe放在同一目录下, 程序会自动使用当前目录下的dbghelp.dll, 详见[DbgHelp 版本](https://learn.microsoft.com/windows/win32/debug/dbghelp-versions)
