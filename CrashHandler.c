@@ -374,11 +374,7 @@ int WINAPI DebuggerEntryPoint(
 								}
 							}
 
-							if (
-								bCalledNtTerminateProcess ||
-								(DebugEvent.u.ExitThread.dwExitCode == LastExceptionRecord.ExceptionCode &&
-								DebugEvent.dwThreadId == dwLastExceptionThreadId)
-							) {
+							if (bCalledNtTerminateProcess) {
 								uExitCode = DumpProcess(
 									lpDumpFile,
 									dwDumpType,
