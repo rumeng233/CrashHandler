@@ -3,7 +3,7 @@
 [![License: LGPL v3](https://img.shields.io/badge/License-LGPL%20v3-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 [![GitHub Release](https://img.shields.io/github/v/release/rumeng233/CrashHandler)](https://github.com/rumeng233/CrashHandler/releases)
 
-一个轻量级Windows崩溃捕获工具，通过**附加调试器**在目标进程发生未处理异常或异常退出(开启`AbnormalExitDump`)时自动生成转储
+一个轻量级Windows崩溃捕获工具，通过**附加调试器**在目标进程发生未处理异常或异常退出(需开启`AbnormalExitDump`)时自动生成转储
 
 ## 参数格式
 ```cmd
