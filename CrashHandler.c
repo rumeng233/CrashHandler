@@ -26,12 +26,15 @@ typedef NTSTATUS(WINAPI* pNtQueryInformationThread)(
 typedef NTSTATUS(NTAPI* pRtlGetVersion)(POSVERSIONINFOEXW);
 
 // 有时可能出现主线程退出但进程还在的情况(例如crypt32.dll线程残留), 故使用ExitProcess显式退出
-static int Exit(_In_ UINT uExitCode) {
+static int Exit(_In_ UINT uExitCode, _In_opt_ HANDLE hProcess) {
+	if (hProcess) {
+		CloseHandle(hProcess);
+	}
 	ExitProcess(uExitCode);
 	return uExitCode;
 }
 
-static void* __cdecl Memset(void* dest, int ch, size_t count)
+static void* __cdecl Memset(void* dest, int ch, SIZE_T count)
 {
 	__stosb((unsigned char*)dest, (unsigned char)ch, count);
 	return dest;
@@ -62,6 +65,7 @@ static UINT DumpProcess(
 	_In_ DWORD dwDumpType,
 	_In_ DWORD dwProcessId, 
 	_In_ DWORD dwThreadId, 
+	_In_ HANDLE hProcess,
 	_In_ EXCEPTION_RECORD* pExceptionRecord,
 	_In_opt_ CONTEXT* pContextRecord
 ) {
@@ -109,23 +113,16 @@ static UINT DumpProcess(
 		ExceptionParam.ExceptionPointers = &ExceptionPointers;
 		ExceptionParam.ClientPointers = FALSE;
 
-		HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, FALSE, dwProcessId);
-		if (hProcess) {
-			if (!MiniDumpWriteDump(
-				hProcess,
-				dwProcessId,
-				hFile,
-				dwDumpType,
-				&ExceptionParam,
-				NULL,
-				NULL
-			)) {
-				uExitCode = STATUS_UNSUCCESSFUL;
-			}
-			CloseHandle(hProcess);
-		}
-		else {
-			uExitCode = STATUS_ACCESS_DENIED;
+		if (!MiniDumpWriteDump(
+			hProcess,
+			dwProcessId,
+			hFile,
+			dwDumpType,
+			&ExceptionParam,
+			NULL,
+			NULL
+		)) {
+			uExitCode = STATUS_UNSUCCESSFUL;
 		}
 		CloseHandle(hFile);
 	}
@@ -136,13 +133,62 @@ static UINT DumpProcess(
 	return uExitCode;
 }
 
+static BOOL IsProcessTerminateSelf(
+	_In_ DWORD dwProcessId, 
+	_In_opt_ pNtQueryInformationThread NtQueryInformationThread, 
+	_In_opt_ USHORT uNtTerminateProcessSyscall,
+	_In_ BOOL bWindows8
+) {
+	if (NtQueryInformationThread && uNtTerminateProcessSyscall) {
+		HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, dwProcessId);
+		if (hSnap != INVALID_HANDLE_VALUE) {
+			THREADENTRY32 ThreadEntry;
+			Memset(&ThreadEntry, 0, sizeof(ThreadEntry));
+			ThreadEntry.dwSize = sizeof(ThreadEntry);
+
+			BOOL bRet = Thread32First(hSnap, &ThreadEntry);
+			while (bRet) {
+				if (ThreadEntry.th32OwnerProcessID == dwProcessId) {
+					HANDLE hThread = OpenThread(THREAD_GET_CONTEXT, FALSE, ThreadEntry.th32ThreadID);
+					if (hThread) {
+						THREAD_LAST_SYSCALL_INFORMATION LastSyscall;
+						Memset(&LastSyscall, 0, sizeof(LastSyscall));
+						NTSTATUS status = NtQueryInformationThread(
+							hThread,
+							21, // ThreadLastSystemCall
+							&LastSyscall,
+							bWindows8 ? sizeof(LastSyscall) : FIELD_OFFSET(THREAD_LAST_SYSCALL_INFORMATION, WaitTime),
+							NULL
+						);
+						CloseHandle(hThread);
+
+						if (NT_SUCCESS(status)) {
+							// 验证异常线程的最后一次系统调用是否是NtTerminateProcess
+							// 如果是则认为是被自身结束(如TerminateProcess、ExitProcess、Environment.Exit等)
+							// 否则则认为是被外部结束的, 需要判断退出代码
+							if (LastSyscall.SystemCallNumber == uNtTerminateProcessSyscall) {
+								return TRUE;
+							}
+						}
+					}
+				}
+				bRet = Thread32Next(hSnap, &ThreadEntry);
+			}
+
+			CloseHandle(hSnap);
+		}
+	}
+	
+	return FALSE;
+}
+
 int WINAPI DebuggerEntryPoint(
 	_In_ HINSTANCE hInstance, 
 	_In_opt_ HINSTANCE hPrevInstance, 
 	_In_ LPWSTR lpCmdLine, 
 	_In_ int nCmdShow
 ) {
-	DWORD dwProcessId = 0L;
+	DWORD dwProcessId = 0;
 	WCHAR lpDumpFile[MAX_PATH];
 	BOOL bKillOnExit = TRUE;
 	BOOL bAbnormalExitDump = FALSE;
@@ -162,7 +208,7 @@ int WINAPI DebuggerEntryPoint(
 	if (argv && argc > 2) {
 		if (!StrToIntExW(argv[1], STIF_DEFAULT, (int*)&dwProcessId)) {
 			LocalFree(argv);
-			return Exit(STATUS_INVALID_PARAMETER_1);
+			return Exit(STATUS_INVALID_PARAMETER_1, NULL);
 		}
 		(void)lstrcpynW(lpDumpFile, argv[2], MAX_PATH);
 		if (argc > 3) {
@@ -178,7 +224,7 @@ int WINAPI DebuggerEntryPoint(
 			}
 		}
 		if (argc > 5) {
-			DWORD dwTempDumpType = 0L;
+			DWORD dwTempDumpType = 0;
 			if (StrToIntExW(argv[5], STIF_DEFAULT, (int*)&dwTempDumpType)) {
 				dwDumpType = dwTempDumpType;
 			}
@@ -186,7 +232,7 @@ int WINAPI DebuggerEntryPoint(
 		LocalFree(argv);
 	} else {
 		LocalFree(argv);
-		return Exit(STATUS_INVALID_PARAMETER_MIX);
+		return Exit(STATUS_INVALID_PARAMETER_MIX, NULL);
 	}
 
 	// 消除游标反馈, 因为子系统为WINDOWS但却未创建任何窗口
@@ -195,7 +241,12 @@ int WINAPI DebuggerEntryPoint(
 	PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE);
 
 	if (!DebugActiveProcess(dwProcessId)) {
-		return Exit(STATUS_DEBUG_ATTACH_FAILED);
+		return Exit(STATUS_DEBUG_ATTACH_FAILED, NULL);
+	}
+	HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, FALSE, dwProcessId);
+	if (!hProcess) {
+		DebugActiveProcessStop(dwProcessId);
+		return Exit(STATUS_ACCESS_DENIED, NULL);
 	}
 	DebugSetProcessKillOnExit(bKillOnExit);
 
@@ -289,106 +340,100 @@ int WINAPI DebuggerEntryPoint(
 						dwDumpType,
 						dwProcessId,
 						DebugEvent.dwThreadId,
+						hProcess,
 						&DebugEvent.u.Exception.ExceptionRecord,
 						NULL
 					);
 					// 使目标进程的UnhandledExceptionFilter在调试器断开后也有机会执行
 					ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
 					DebugActiveProcessStop(dwProcessId);
-					return Exit(uExitCode);
+					return Exit(uExitCode, hProcess);
 				}
 				ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_EXCEPTION_NOT_HANDLED);
+				break;
+
+			case CREATE_THREAD_DEBUG_EVENT:
+				if (DebugEvent.u.CreateThread.hThread) {
+					CloseHandle(DebugEvent.u.CreateThread.hThread);
+				}
+				ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
 				break;
 
 			case CREATE_PROCESS_DEBUG_EVENT:
 				if (DebugEvent.u.CreateProcessInfo.hFile) {
 					CloseHandle(DebugEvent.u.CreateProcessInfo.hFile);
 				}
-				ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
-				break;
-
-			case LOAD_DLL_DEBUG_EVENT:
-				if (DebugEvent.u.LoadDll.hFile) {
-					CloseHandle(DebugEvent.u.LoadDll.hFile);
+				if (DebugEvent.u.CreateProcessInfo.hThread) {
+					CloseHandle(DebugEvent.u.CreateProcessInfo.hThread);
+				}
+				if (DebugEvent.u.CreateProcessInfo.hProcess) {
+					CloseHandle(DebugEvent.u.CreateProcessInfo.hProcess);
 				}
 				ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
 				break;
 
-			case EXIT_PROCESS_DEBUG_EVENT:
-				ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
-				DebugActiveProcessStop(dwProcessId);
-				return Exit(uExitCode);
-
 			case EXIT_THREAD_DEBUG_EVENT:
 				if (bAbnormalExitDump) {
 					DWORD dwProcessExitCode = STATUS_SUCCESS;
-					// 不使用PROCESS_QUERY_LIMITED_INFORMATION防止老系统不支持
-					HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, dwProcessId);
-					if (hProcess) {
-						// 获取进程而不是线程的退出代码
-						GetExitCodeProcess(hProcess, &dwProcessExitCode);
-						CloseHandle(hProcess);
-					}
+					// 获取进程而不是线程的退出代码
+					GetExitCodeProcess(hProcess, &dwProcessExitCode);
 					if (dwProcessExitCode != STATUS_SUCCESS && dwProcessExitCode != STILL_ACTIVE) {
 						if (bHasLastExceptionRecord) {
-
-							BOOL bCalledNtTerminateProcess = FALSE;
-							if (NtQueryInformationThread && uNtTerminateProcessSyscall) {
-								HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, dwProcessId);
-								if (hSnap != INVALID_HANDLE_VALUE) {
-									THREADENTRY32 ThreadEntry;
-									Memset(&ThreadEntry, 0, sizeof(ThreadEntry));
-									ThreadEntry.dwSize = sizeof(ThreadEntry);
-
-									BOOL bRet = Thread32First(hSnap, &ThreadEntry);
-									while (bRet) {
-										if (ThreadEntry.th32OwnerProcessID == dwProcessId) {
-											HANDLE hThread = OpenThread(THREAD_GET_CONTEXT, FALSE, ThreadEntry.th32ThreadID);
-											if (hThread) {
-												THREAD_LAST_SYSCALL_INFORMATION LastSyscall;
-												Memset(&LastSyscall, 0, sizeof(LastSyscall));
-												NTSTATUS status = NtQueryInformationThread(
-													hThread,
-													21, // ThreadLastSystemCall
-													&LastSyscall,
-													bWindows8 ? sizeof(LastSyscall) : FIELD_OFFSET(THREAD_LAST_SYSCALL_INFORMATION, WaitTime),
-													NULL
-												);
-												if (NT_SUCCESS(status)) {
-													// 验证异常线程的最后一次系统调用是否是NtTerminateProcess
-													// 如果是则认为是被自身结束(如TerminateProcess、ExitProcess、Environment.Exit等)
-													// 否则则认为是被外部结束的, 需要判断退出代码
-													bCalledNtTerminateProcess = LastSyscall.SystemCallNumber == uNtTerminateProcessSyscall;
-												}
-												CloseHandle(hThread);
-
-												if (bCalledNtTerminateProcess) {
-													break;
-												}
-											}
-										}
-										bRet = Thread32Next(hSnap, &ThreadEntry);
-									}
-
-									CloseHandle(hSnap);
-								}
-							}
-
-							if (bCalledNtTerminateProcess) {
+							if (IsProcessTerminateSelf(
+								dwProcessId, 
+								NtQueryInformationThread, 
+								uNtTerminateProcessSyscall, 
+								bWindows8
+							)) {
 								uExitCode = DumpProcess(
 									lpDumpFile,
 									dwDumpType,
 									dwProcessId,
 									dwLastExceptionThreadId,
+									hProcess,
 									&LastExceptionRecord,
 									&LastContextRecord
 								);
 								ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
 								DebugActiveProcessStop(dwProcessId);
-								return Exit(uExitCode);
+								return Exit(uExitCode, hProcess);
 							}
 						}
 					}
+				}
+				ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
+				break;
+
+			case EXIT_PROCESS_DEBUG_EVENT:
+				if (bAbnormalExitDump) {
+					if (DebugEvent.u.ExitProcess.dwExitCode != STATUS_SUCCESS && DebugEvent.u.ExitProcess.dwExitCode != STILL_ACTIVE) {
+						if (bHasLastExceptionRecord) {
+							if (IsProcessTerminateSelf(
+								dwProcessId,
+								NtQueryInformationThread,
+								uNtTerminateProcessSyscall,
+								bWindows8
+							)) {
+								uExitCode = DumpProcess(
+									lpDumpFile,
+									dwDumpType,
+									dwProcessId,
+									dwLastExceptionThreadId,
+									hProcess,
+									&LastExceptionRecord,
+									&LastContextRecord
+								);
+							}
+						}
+					}
+				}
+				ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
+				DebugActiveProcessStop(dwProcessId);
+				return Exit(uExitCode, hProcess);
+
+			case LOAD_DLL_DEBUG_EVENT:
+				if (DebugEvent.u.LoadDll.hFile) {
+					CloseHandle(DebugEvent.u.LoadDll.hFile);
 				}
 				ContinueDebugEvent(dwProcessId, DebugEvent.dwThreadId, DBG_CONTINUE);
 				break;
@@ -400,5 +445,5 @@ int WINAPI DebuggerEntryPoint(
 	}
 
 	DebugActiveProcessStop(dwProcessId);
-	return Exit(STATUS_DEBUGGER_INACTIVE);
+	return Exit(STATUS_DEBUGGER_INACTIVE, hProcess);
 }
